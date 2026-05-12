@@ -3,7 +3,7 @@ import logging
 import os
 from datetime import date, timedelta
 from typing import Optional
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import FastAPI, HTTPException, Header, BackgroundTasks
 from pydantic import BaseModel
 from . import db, fetcher, feishu, config
 
@@ -40,31 +40,25 @@ class DailyRequest(BaseModel):
     sids: Optional[list] = None  # optional filter; default = all active
 
 
-@app.post("/daily")
-async def daily(req: DailyRequest, authorization: Optional[str] = Header(None)):
-    _auth(authorization)
-    target_date = req.date or (date.today() - timedelta(days=2)).isoformat()
+async def _daily_run(target_date: str, sids_filter):
     try:
         sellers = await fetcher.fetch_active_sellers()
-        if req.sids:
-            allow = {int(s) for s in req.sids}
+        if sids_filter:
+            allow = {int(s) for s in sids_filter}
             sellers = [s for s in sellers if s["sid"] in allow]
-        log.info(f"daily start date={target_date} sellers={len(sellers)}")
+        log.info(f"daily bg start date={target_date} sellers={len(sellers)}")
         total_rows = 0
-        per_seller = []
         errors = []
         for s in sellers:
             try:
                 rows = await fetcher.fetch_day_rows(s["sid"], s["name"], target_date)
-                n = db.upsert_daily_rows(rows)
+                db.upsert_daily_rows(rows)
                 total_rows += len(rows)
-                per_seller.append({"sid": s["sid"], "name": s["name"], "rows": len(rows)})
             except Exception as e:
                 log.exception(f"sid={s['sid']} fail")
                 errors.append({"sid": s["sid"], "name": s["name"], "err": str(e)[:200]})
             await asyncio.sleep(0.5)
-        result = {"date": target_date, "sellers": len(sellers), "total_rows": total_rows,
-                  "per_seller": per_seller, "errors": errors}
+        log.info(f"daily bg done date={target_date} rows={total_rows} errors={len(errors)}")
         if errors and len(errors) >= max(1, len(sellers) // 3):
             _state["consecutive_failures"] += 1
             msg = f"daily {target_date} {len(errors)}/{len(sellers)} 店失败 (连续 {_state['consecutive_failures']} 次): {errors[:3]}"
@@ -73,14 +67,46 @@ async def daily(req: DailyRequest, authorization: Optional[str] = Header(None)):
                 await feishu.alert_group(msg)
         else:
             _state["consecutive_failures"] = 0
-        return result
     except Exception as e:
-        log.exception("daily fatal")
+        log.exception("daily bg fatal")
         _state["consecutive_failures"] += 1
         await feishu.alert_frankie(f"daily {target_date} FATAL: {str(e)[:300]} (连续 {_state['consecutive_failures']} 次)")
         if _state["consecutive_failures"] >= 3:
             await feishu.alert_group(f"daily {target_date} FATAL 连续 3 次以上: {str(e)[:300]}")
-        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/daily")
+async def daily(req: DailyRequest, background: BackgroundTasks, authorization: Optional[str] = Header(None)):
+    """Fire-and-forget: kick off background ingest, return immediately so n8n cron doesn't hit gateway timeout."""
+    _auth(authorization)
+    target_date = req.date or (date.today() - timedelta(days=2)).isoformat()
+    background.add_task(_daily_run, target_date, req.sids)
+    return {"accepted": True, "date": target_date, "sids": req.sids or "all-active"}
+
+
+@app.post("/daily-sync")
+async def daily_sync(req: DailyRequest, authorization: Optional[str] = Header(None)):
+    """Synchronous variant for manual testing — waits for completion."""
+    _auth(authorization)
+    target_date = req.date or (date.today() - timedelta(days=2)).isoformat()
+    sellers = await fetcher.fetch_active_sellers()
+    if req.sids:
+        allow = {int(s) for s in req.sids}
+        sellers = [s for s in sellers if s["sid"] in allow]
+    total_rows = 0
+    per_seller = []
+    errors = []
+    for s in sellers:
+        try:
+            rows = await fetcher.fetch_day_rows(s["sid"], s["name"], target_date)
+            db.upsert_daily_rows(rows)
+            total_rows += len(rows)
+            per_seller.append({"sid": s["sid"], "name": s["name"], "rows": len(rows)})
+        except Exception as e:
+            errors.append({"sid": s["sid"], "name": s["name"], "err": str(e)[:200]})
+        await asyncio.sleep(0.5)
+    return {"date": target_date, "sellers": len(sellers), "total_rows": total_rows,
+            "per_seller": per_seller, "errors": errors}
 
 
 class BackfillRequest(BaseModel):
@@ -90,38 +116,45 @@ class BackfillRequest(BaseModel):
     sleep_between_days: float = 2.0
 
 
+async def _backfill_run(start_date: str, end_date: str, sids_filter, sleep_between_days: float):
+    try:
+        start = date.fromisoformat(start_date)
+        end = date.fromisoformat(end_date)
+        sellers = await fetcher.fetch_active_sellers()
+        if sids_filter:
+            allow = {int(s) for s in sids_filter}
+            sellers = [s for s in sellers if s["sid"] in allow]
+        log.info(f"backfill bg {start}..{end} sellers={len(sellers)}")
+        cur = start
+        while cur <= end:
+            ds = cur.isoformat()
+            day_total = 0
+            day_errors = []
+            for s in sellers:
+                try:
+                    rows = await fetcher.fetch_day_rows(s["sid"], s["name"], ds)
+                    db.upsert_daily_rows(rows)
+                    day_total += len(rows)
+                except Exception as e:
+                    log.exception(f"backfill sid={s['sid']} date={ds} fail")
+                    day_errors.append({"sid": s["sid"], "err": str(e)[:200]})
+                await asyncio.sleep(0.5)
+            log.info(f"backfill {ds} rows={day_total} errors={len(day_errors)}")
+            await asyncio.sleep(sleep_between_days)
+            cur += timedelta(days=1)
+        await feishu.alert_frankie(f"backfill {start_date}..{end_date} done")
+    except Exception as e:
+        log.exception("backfill bg fatal")
+        await feishu.alert_frankie(f"backfill {start_date}..{end_date} FATAL: {str(e)[:300]}")
+
+
 @app.post("/backfill")
-async def backfill(req: BackfillRequest, authorization: Optional[str] = Header(None)):
+async def backfill(req: BackfillRequest, background: BackgroundTasks, authorization: Optional[str] = Header(None)):
     _auth(authorization)
-    start = date.fromisoformat(req.start_date)
-    end = date.fromisoformat(req.end_date)
-    if start > end:
+    if date.fromisoformat(req.start_date) > date.fromisoformat(req.end_date):
         raise HTTPException(status_code=400, detail="start_date > end_date")
-    sellers = await fetcher.fetch_active_sellers()
-    if req.sids:
-        allow = {int(s) for s in req.sids}
-        sellers = [s for s in sellers if s["sid"] in allow]
-    log.info(f"backfill {start}..{end} sellers={len(sellers)}")
-    summary = []
-    cur = start
-    while cur <= end:
-        ds = cur.isoformat()
-        day_total = 0
-        day_errors = []
-        for s in sellers:
-            try:
-                rows = await fetcher.fetch_day_rows(s["sid"], s["name"], ds)
-                db.upsert_daily_rows(rows)
-                day_total += len(rows)
-            except Exception as e:
-                log.exception(f"backfill sid={s['sid']} date={ds} fail")
-                day_errors.append({"sid": s["sid"], "err": str(e)[:200]})
-            await asyncio.sleep(0.5)
-        summary.append({"date": ds, "rows": day_total, "errors": day_errors})
-        log.info(f"backfill {ds} rows={day_total} errors={len(day_errors)}")
-        await asyncio.sleep(req.sleep_between_days)
-        cur += timedelta(days=1)
-    return {"start": req.start_date, "end": req.end_date, "summary": summary}
+    background.add_task(_backfill_run, req.start_date, req.end_date, req.sids, req.sleep_between_days)
+    return {"accepted": True, "start": req.start_date, "end": req.end_date, "sids": req.sids or "all-active"}
 
 
 class QueryRequest(BaseModel):
