@@ -5,7 +5,7 @@ from datetime import date, timedelta
 from typing import Optional
 from fastapi import FastAPI, HTTPException, Header, BackgroundTasks
 from pydantic import BaseModel
-from . import db, fetcher, feishu, config
+from . import db, fetcher, feishu, config, weekly
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 log = logging.getLogger("amazon-search-term")
@@ -188,6 +188,27 @@ async def query_windows(req: QueryRequest, authorization: Optional[str] = Header
         "t_14": t_14.isoformat(), "t_30": t_30.isoformat(), "t_60": t_60.isoformat(),
         "rows": rows, "count": len(rows),
     }
+
+
+class WeeklyDataRequest(BaseModel):
+    end_date: Optional[str] = None    # default = T-8
+    t14: int = 14
+    t30: int = 30
+    t60: int = 60
+    offset_days: int = 8
+
+
+@app.post("/weekly-data")
+async def weekly_data(req: WeeklyDataRequest, authorization: Optional[str] = Header(None)):
+    """Aggregated payload for v2 weekly report (n8n N2 hits this).
+
+    Returns: report_date, windows{}, owner_results{owner:{store:{boost/scale/negate/warn/...}}}, stats{}.
+    Side effect: persists this week's recs into search_term_recommendation for next-week diff.
+    """
+    _auth(authorization)
+    end = date.fromisoformat(req.end_date) if req.end_date else None
+    return weekly.build_weekly_data(end_date=end, t14=req.t14, t30=req.t30, t60=req.t60,
+                                    offset_days=req.offset_days)
 
 
 @app.get("/coverage")
