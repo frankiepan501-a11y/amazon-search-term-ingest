@@ -153,17 +153,19 @@ _TOKEN_RE = re.compile(r"[a-zA-Z0-9]+")
 
 
 def compute_stem(query: str) -> str:
-    """Stem a multi-word query: strip prepositions, lowercase, stem each token, sort, join.
+    """Stem a multi-word query: strip prepositions, lowercase, stem each token in ORIGINAL ORDER.
 
-    Sort makes word order differences fold into the same key, e.g.:
-      "switch 2 case" and "case switch 2" → same stem.
+    Word order is preserved (per 陈翔宇 2026-05-13 feedback): "单词调换位置组成的长尾词不应同根".
+    Examples:
+      "controles nintendo switch 2" → "control nintendo switch 2"
+      "controller nintendo switch 2" → "control nintendo switch 2"  ← same stem ✓
+      "nintendo switch 2 controles"  → "nintendo switch 2 control"  ← different ✓ (different word order)
     """
     if not query:
         return ""
     tokens = _TOKEN_RE.findall(query.lower())
     kept = [t for t in tokens if t not in _STOP_PREPS]
     stems = [porter_stem(t) for t in kept]
-    stems.sort()
     return " ".join(stems)
 
 
