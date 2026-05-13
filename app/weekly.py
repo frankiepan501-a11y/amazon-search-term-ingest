@@ -64,23 +64,31 @@ def build_weekly_data(end_date: date = None, t14: int = 14, t30: int = 30, t60: 
 
 
 async def _enrich_campaign_names_async(rows: list) -> list:
-    """Build (sid, campaign_id) → name map by calling spCampaigns per sid, then inject."""
-    sids = {int(r["sid"]) for r in rows if r.get("sid")}
-    name_map = {}
-    for sid in sids:
+    """Build (sid, campaign_id) → name map by calling spCampaigns per sid in PARALLEL, then inject."""
+    sids = list({int(r["sid"]) for r in rows if r.get("sid")})
+
+    async def _fetch_one(sid):
         try:
             camps = await lingxing.sp_campaigns(sid)
+            out = {}
             for c in camps:
                 cid = c.get("campaign_id")
                 nm = c.get("name") or ""
                 if cid is not None and nm:
                     try:
-                        name_map[(sid, int(cid))] = nm
+                        out[(sid, int(cid))] = nm
                     except (TypeError, ValueError):
                         pass
+            return out
         except Exception:
-            pass
-        await asyncio.sleep(0.3)
+            return {}
+
+    # Run all sids in parallel (max ~20 — within Lingxing rate limit)
+    results = await asyncio.gather(*(_fetch_one(s) for s in sids))
+    name_map = {}
+    for m in results:
+        name_map.update(m)
+
     for r in rows:
         cid = r.get("campaign_id"); sid = r.get("sid")
         if cid and sid:
