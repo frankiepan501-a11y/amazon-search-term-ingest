@@ -216,8 +216,8 @@ async def weekly_data(req: WeeklyDataRequest = None, authorization: Optional[str
         req = WeeklyDataRequest()
     end = date.fromisoformat(req.end_date) if req.end_date else None
     offset = req.offset_days if req.offset_days is not None else PRODUCTION_OFFSET_DAYS
-    return weekly.build_weekly_data(end_date=end, t14=req.t14, t30=req.t30, t60=req.t60,
-                                    offset_days=offset)
+    return await weekly.build_weekly_data_async(end_date=end, t14=req.t14, t30=req.t30, t60=req.t60,
+                                                offset_days=offset)
 
 
 @app.get("/coverage")

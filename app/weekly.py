@@ -1,8 +1,9 @@
 """/weekly-data orchestrator: pull aggregates + last-week recs + neg snapshot + bid history,
 then run classify + group → return owner-keyed structured payload for n8n N5 renderer.
 """
+import asyncio
 from datetime import date, timedelta
-from . import db, analysis
+from . import db, analysis, lingxing
 
 
 def _safe_float(v):
@@ -27,35 +28,24 @@ def _row_to_safe(r):
     return out
 
 
-def build_weekly_data(end_date: date = None, t14: int = 14, t30: int = 30, t60: int = 60,
-                     offset_days: int = 8):
-    """Main entry. Returns dict ready for JSON response."""
+async def build_weekly_data_async(end_date: date = None, t14: int = 14, t30: int = 30, t60: int = 60,
+                                   offset_days: int = 8):
+    """Async main entry. FastAPI handler awaits this."""
     end = end_date or (date.today() - timedelta(days=offset_days))
     start = end - timedelta(days=t60 - 1)
     t_14 = end - timedelta(days=t14 - 1)
     t_30 = end - timedelta(days=t30 - 1)
     t_60 = end - timedelta(days=t60 - 1)
 
-    # 1. aggregate windows
     raw = db.aggregate_windows(start, end, t_14, t_30, t_60)
     rows = [_row_to_safe(r) for r in raw]
 
-    # 2. last-week recommendations (本周报告 - 7 天)
+    rows = await _enrich_campaign_names_async(rows)
+
     last_week_recs = _load_last_week_recs(end)
-
-    # 3. current neg-keyword snapshot (most recent within last 3 days)
     neg_set = _load_neg_snapshot(end)
-
-    # 4. bid history: latest bid per (sid, query) — already returned by aggregate (bid_latest)
-    bid_history = {}  # not needed separately; analysis._operation_status reads row['bid_latest']
-
-    # 5. classify + 同根铁律 + diff
-    classified = analysis.classify_rows(rows, neg_set, last_week_recs, bid_history)
-
-    # 6. group by owner -> store
+    classified = analysis.classify_rows(rows, neg_set, last_week_recs, {})
     grouped = analysis.group_by_owner_store(classified)
-
-    # 7. persist this week's NEW recommendations into search_term_recommendation for next-week diff
     _persist_new_recs(grouped, end)
 
     return {
@@ -65,6 +55,42 @@ def build_weekly_data(end_date: date = None, t14: int = 14, t30: int = 30, t60: 
         "owner_results": grouped,
         "stats": _stats(grouped),
     }
+
+
+# legacy sync wrapper for any non-async callers
+def build_weekly_data(end_date: date = None, t14: int = 14, t30: int = 30, t60: int = 60,
+                     offset_days: int = 8):
+    return asyncio.run(build_weekly_data_async(end_date, t14, t30, t60, offset_days))
+
+
+async def _enrich_campaign_names_async(rows: list) -> list:
+    """Build (sid, campaign_id) → name map by calling spCampaigns per sid, then inject."""
+    sids = {int(r["sid"]) for r in rows if r.get("sid")}
+    name_map = {}
+    for sid in sids:
+        try:
+            camps = await lingxing.sp_campaigns(sid)
+            for c in camps:
+                cid = c.get("campaign_id")
+                nm = c.get("name") or ""
+                if cid is not None and nm:
+                    try:
+                        name_map[(sid, int(cid))] = nm
+                    except (TypeError, ValueError):
+                        pass
+        except Exception:
+            pass
+        await asyncio.sleep(0.3)
+    for r in rows:
+        cid = r.get("campaign_id"); sid = r.get("sid")
+        if cid and sid:
+            try:
+                nm = name_map.get((int(sid), int(cid)))
+                if nm:
+                    r["campaign_name"] = nm
+            except (TypeError, ValueError):
+                pass
+    return rows
 
 
 def _load_last_week_recs(report_date: date) -> dict:

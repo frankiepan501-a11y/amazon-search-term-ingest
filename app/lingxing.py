@@ -142,3 +142,13 @@ async def query_neg_words(sid: int) -> list:
         {"sid": sid},
         page_size=100, is_newad=True,
     )
+
+
+async def sp_campaigns(sid: int) -> list:
+    """SP campaign list — yields {campaign_id, name, campaign_type, state, ...}.
+    Source of campaign_id → human-readable name mapping (spProductAds doesn't expose name)."""
+    return await call_all(
+        "/pb/openapi/newad/spCampaigns",
+        {"sid": sid},
+        page_size=100, is_newad=True,
+    )
