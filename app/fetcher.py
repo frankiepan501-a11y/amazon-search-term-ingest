@@ -107,6 +107,31 @@ async def fetch_day_rows(sid: int, store_name: str, report_date: str):
     return out
 
 
+async def fetch_placement_day(sid: int, store_name: str, report_date: str):
+    """Pull campaignPlacementReports for one day, map campaign→ASIN→owner."""
+    rows = await lingxing.campaign_placement_reports(sid, report_date)
+    c_to_asin, c_to_name, asin_to_owner = await fetch_seller_meta(sid)
+    out = []
+    for r in rows:
+        cid = r.get("campaign_id") or 0
+        asin = c_to_asin.get(cid, "")
+        owner = asin_to_owner.get(asin, "未分配")
+        out.append({
+            "sid": sid,
+            "store_name": store_name,
+            "report_date": report_date,
+            "campaign_id": cid or 0,
+            "placement_type": r.get("placement_type") or "UNKNOWN",
+            "owner": owner,
+            "impressions": _i(r.get("impressions")),
+            "clicks": _i(r.get("clicks")),
+            "cost": _f(r.get("cost")),
+            "orders": _i(r.get("orders")),
+            "sales": _f(r.get("sales")),
+        })
+    return out
+
+
 async def fetch_active_sellers():
     sellers = await lingxing.list_sellers()
     # filter to active = has data in any newad endpoint today? Use status/seller_status if present

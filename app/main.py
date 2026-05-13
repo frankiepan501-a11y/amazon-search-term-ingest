@@ -48,6 +48,7 @@ async def _daily_run(target_date: str, sids_filter):
             sellers = [s for s in sellers if s["sid"] in allow]
         log.info(f"daily bg start date={target_date} sellers={len(sellers)}")
         total_rows = 0
+        plc_rows_total = 0
         errors = []
         for s in sellers:
             try:
@@ -55,10 +56,17 @@ async def _daily_run(target_date: str, sids_filter):
                 db.upsert_daily_rows(rows)
                 total_rows += len(rows)
             except Exception as e:
-                log.exception(f"sid={s['sid']} fail")
-                errors.append({"sid": s["sid"], "name": s["name"], "err": str(e)[:200]})
+                log.exception(f"sid={s['sid']} search-term fail")
+                errors.append({"sid": s["sid"], "name": s["name"], "err": f"st:{str(e)[:120]}"})
+            try:
+                plc = await fetcher.fetch_placement_day(s["sid"], s["name"], target_date)
+                db.upsert_placement_rows(plc)
+                plc_rows_total += len(plc)
+            except Exception as e:
+                log.exception(f"sid={s['sid']} placement fail")
+                errors.append({"sid": s["sid"], "name": s["name"], "err": f"plc:{str(e)[:120]}"})
             await asyncio.sleep(0.5)
-        log.info(f"daily bg done date={target_date} rows={total_rows} errors={len(errors)}")
+        log.info(f"daily bg done date={target_date} st_rows={total_rows} plc_rows={plc_rows_total} errors={len(errors)}")
         if errors and len(errors) >= max(1, len(sellers) // 3):
             _state["consecutive_failures"] += 1
             msg = f"daily {target_date} {len(errors)}/{len(sellers)} 店失败 (连续 {_state['consecutive_failures']} 次): {errors[:3]}"
@@ -114,9 +122,12 @@ class BackfillRequest(BaseModel):
     end_date: str    # YYYY-MM-DD inclusive
     sids: Optional[list] = None
     sleep_between_days: float = 2.0
+    include_placement: bool = True
+    placement_only: bool = False  # if True, skip search-term and only backfill placement
 
 
-async def _backfill_run(start_date: str, end_date: str, sids_filter, sleep_between_days: float):
+async def _backfill_run(start_date: str, end_date: str, sids_filter, sleep_between_days: float,
+                          include_placement: bool = True, placement_only: bool = False):
     try:
         start = date.fromisoformat(start_date)
         end = date.fromisoformat(end_date)
@@ -124,22 +135,31 @@ async def _backfill_run(start_date: str, end_date: str, sids_filter, sleep_betwe
         if sids_filter:
             allow = {int(s) for s in sids_filter}
             sellers = [s for s in sellers if s["sid"] in allow]
-        log.info(f"backfill bg {start}..{end} sellers={len(sellers)}")
+        log.info(f"backfill bg {start}..{end} sellers={len(sellers)} include_plc={include_placement} plc_only={placement_only}")
         cur = start
         while cur <= end:
             ds = cur.isoformat()
-            day_total = 0
+            day_total = 0; plc_total = 0
             day_errors = []
             for s in sellers:
-                try:
-                    rows = await fetcher.fetch_day_rows(s["sid"], s["name"], ds)
-                    db.upsert_daily_rows(rows)
-                    day_total += len(rows)
-                except Exception as e:
-                    log.exception(f"backfill sid={s['sid']} date={ds} fail")
-                    day_errors.append({"sid": s["sid"], "err": str(e)[:200]})
+                if not placement_only:
+                    try:
+                        rows = await fetcher.fetch_day_rows(s["sid"], s["name"], ds)
+                        db.upsert_daily_rows(rows)
+                        day_total += len(rows)
+                    except Exception as e:
+                        log.exception(f"backfill sid={s['sid']} date={ds} st fail")
+                        day_errors.append({"sid": s["sid"], "err": f"st:{str(e)[:100]}"})
+                if include_placement or placement_only:
+                    try:
+                        plc = await fetcher.fetch_placement_day(s["sid"], s["name"], ds)
+                        db.upsert_placement_rows(plc)
+                        plc_total += len(plc)
+                    except Exception as e:
+                        log.exception(f"backfill sid={s['sid']} date={ds} plc fail")
+                        day_errors.append({"sid": s["sid"], "err": f"plc:{str(e)[:100]}"})
                 await asyncio.sleep(0.5)
-            log.info(f"backfill {ds} rows={day_total} errors={len(day_errors)}")
+            log.info(f"backfill {ds} st={day_total} plc={plc_total} errors={len(day_errors)}")
             await asyncio.sleep(sleep_between_days)
             cur += timedelta(days=1)
         await feishu.alert_frankie(f"backfill {start_date}..{end_date} done")
@@ -153,8 +173,11 @@ async def backfill(req: BackfillRequest, background: BackgroundTasks, authorizat
     _auth(authorization)
     if date.fromisoformat(req.start_date) > date.fromisoformat(req.end_date):
         raise HTTPException(status_code=400, detail="start_date > end_date")
-    background.add_task(_backfill_run, req.start_date, req.end_date, req.sids, req.sleep_between_days)
-    return {"accepted": True, "start": req.start_date, "end": req.end_date, "sids": req.sids or "all-active"}
+    background.add_task(_backfill_run, req.start_date, req.end_date, req.sids,
+                       req.sleep_between_days, req.include_placement, req.placement_only)
+    return {"accepted": True, "start": req.start_date, "end": req.end_date,
+            "sids": req.sids or "all-active",
+            "include_placement": req.include_placement, "placement_only": req.placement_only}
 
 
 class QueryRequest(BaseModel):

@@ -48,6 +48,9 @@ async def build_weekly_data_async(end_date: date = None, t14: int = 14, t30: int
     grouped = analysis.group_by_owner_store(classified)
     _persist_new_recs(grouped, end)
 
+    # Placement analysis (B-Full milestone) — aggregate 14d, classify, inject into grouped
+    _inject_placement(grouped, t_14, end)
+
     return {
         "report_date": end.isoformat(),
         "windows": {"t_14": t_14.isoformat(), "t_30": t_30.isoformat(), "t_60": t_60.isoformat()},
@@ -55,6 +58,85 @@ async def build_weekly_data_async(end_date: date = None, t14: int = 14, t30: int
         "owner_results": grouped,
         "stats": _stats(grouped),
     }
+
+
+def _inject_placement(grouped: dict, t_14, end):
+    """Build placement structure per (owner, store) for N5 sr.placement rendering."""
+    raw = db.aggregate_placement_14d(t_14, end)
+    # raw rows: {owner, store_name, sid, placement_type, impressions, clicks, cost, orders, sales}
+    by_os = {}  # (owner, store) → [rows]
+    for r in raw:
+        owner = r["owner"] or "未分配"
+        store = r["store_name"] or ""
+        by_os.setdefault((owner, store), []).append(r)
+
+    for (owner, store), rows in by_os.items():
+        if owner == "未分配":
+            continue
+        if owner not in grouped or store not in grouped[owner]:
+            continue
+        items = []
+        total_clicks = 0
+        total_orders = 0
+        for r in rows:
+            clk = int(r.get("clicks") or 0)
+            ord_ = int(r.get("orders") or 0)
+            cost = float(r.get("cost") or 0)
+            sales = float(r.get("sales") or 0)
+            cvr = round(ord_ / clk * 100, 2) if clk else 0
+            acos = round(cost / sales * 100, 2) if sales else 999
+            items.append({
+                "placement_type": r["placement_type"] or "UNKNOWN",
+                "impressions": int(r.get("impressions") or 0),
+                "clicks": clk,
+                "cost": cost,
+                "orders": ord_,
+                "sales": sales,
+                "cvr": cvr,
+                "acos": acos,
+            })
+            total_clicks += clk
+            total_orders += ord_
+
+        avg_cvr = round(total_orders / total_clicks * 100, 2) if total_clicks else 0
+
+        # Multiplier suggestions (mirror v1 N3 analyzePlc logic)
+        suggestions = []
+        for p in items:
+            if p["clicks"] < 30:
+                suggestions.append({
+                    "placement_type": p["placement_type"], "cvr": p["cvr"],
+                    "ratio": 0, "suggestion": "数据不足",
+                })
+                continue
+            ratio = round(p["cvr"] / avg_cvr, 2) if avg_cvr else 0
+            if ratio >= 2.0:
+                s = "+100%"
+            elif ratio >= 1.5:
+                s = "+50%"
+            elif ratio >= 1.2:
+                s = "+25%"
+            elif ratio <= 0.5:
+                s = "降竞价或关停"
+            else:
+                s = "不调整"
+            suggestions.append({
+                "placement_type": p["placement_type"], "cvr": p["cvr"],
+                "ratio": ratio, "suggestion": s,
+            })
+
+        best = None
+        eligible = [p for p in items if p["clicks"] >= 30]
+        if eligible:
+            best_p = max(eligible, key=lambda x: x["cvr"])
+            best = {"placement_type": best_p["placement_type"], "cvr": best_p["cvr"]}
+
+        grouped[owner][store]["placement"] = {
+            "items": items,
+            "avgCvr": avg_cvr,
+            "multiplierSuggestions": suggestions,
+            "bestPlacement": best,
+        }
 
 
 # legacy sync wrapper for any non-async callers

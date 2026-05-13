@@ -73,6 +73,29 @@ CREATE TABLE IF NOT EXISTS amazon_ads.neg_keyword_snapshot (
 );
 """
 
+DDL_PLACEMENT = """
+CREATE TABLE IF NOT EXISTS amazon_ads.placement_daily (
+  sid            INT          NOT NULL,
+  store_name     TEXT,
+  report_date    DATE         NOT NULL,
+  campaign_id    BIGINT       NOT NULL DEFAULT 0,
+  placement_type TEXT         NOT NULL,
+  owner          TEXT,
+  impressions    INT          DEFAULT 0,
+  clicks         INT          DEFAULT 0,
+  cost           NUMERIC(12,4) DEFAULT 0,
+  orders         INT          DEFAULT 0,
+  sales          NUMERIC(12,4) DEFAULT 0,
+  ingested_at    TIMESTAMP    DEFAULT NOW(),
+  PRIMARY KEY (sid, report_date, campaign_id, placement_type)
+);
+"""
+
+DDL_INDEX_PLACEMENT = [
+    "CREATE INDEX IF NOT EXISTS idx_plc_lookup ON amazon_ads.placement_daily (sid, report_date DESC);",
+    "CREATE INDEX IF NOT EXISTS idx_plc_owner  ON amazon_ads.placement_daily (owner, report_date DESC);",
+]
+
 
 @contextmanager
 def conn():
@@ -98,7 +121,11 @@ def init_schema():
             for sql in DDL_INDEX_REC:
                 cur.execute(sql)
             cur.execute(DDL_NEG_SNAPSHOT)
-    return {"ok": True, "tables": ["search_term_daily", "search_term_recommendation", "neg_keyword_snapshot"]}
+            cur.execute(DDL_PLACEMENT)
+            for sql in DDL_INDEX_PLACEMENT:
+                cur.execute(sql)
+    return {"ok": True, "tables": ["search_term_daily", "search_term_recommendation",
+                                    "neg_keyword_snapshot", "placement_daily"]}
 
 
 UPSERT_DAILY = """
@@ -162,6 +189,53 @@ def aggregate_windows(start_date, end_date, t_14, t_30, t_60):
     with conn() as c:
         with c.cursor() as cur:
             cur.execute(sql, {"start": start_date, "end": end_date, "t14": t_14, "t30": t_30, "t60": t_60})
+            return cur.fetchall()
+
+
+UPSERT_PLACEMENT = """
+INSERT INTO amazon_ads.placement_daily
+(sid, store_name, report_date, campaign_id, placement_type, owner,
+ impressions, clicks, cost, orders, sales)
+VALUES (%(sid)s,%(store_name)s,%(report_date)s,%(campaign_id)s,%(placement_type)s,%(owner)s,
+        %(impressions)s,%(clicks)s,%(cost)s,%(orders)s,%(sales)s)
+ON CONFLICT (sid, report_date, campaign_id, placement_type) DO UPDATE SET
+  store_name=EXCLUDED.store_name,
+  owner=EXCLUDED.owner,
+  impressions=EXCLUDED.impressions,
+  clicks=EXCLUDED.clicks,
+  cost=EXCLUDED.cost,
+  orders=EXCLUDED.orders,
+  sales=EXCLUDED.sales,
+  ingested_at=NOW();
+"""
+
+
+def upsert_placement_rows(rows):
+    if not rows:
+        return 0
+    with conn() as c:
+        with c.cursor() as cur:
+            cur.executemany(UPSERT_PLACEMENT, rows)
+            return cur.rowcount
+
+
+def aggregate_placement_14d(start_date, end_date):
+    """Aggregate placement metrics across the 14-day window grouped by (owner, store, placement_type).
+    14d-only is sufficient for placement (no multi-window rule); follows v1 N5 expectation."""
+    sql = """
+    SELECT owner, store_name, sid, placement_type,
+      SUM(impressions) AS impressions,
+      SUM(clicks)      AS clicks,
+      SUM(cost)        AS cost,
+      SUM(orders)      AS orders,
+      SUM(sales)       AS sales
+    FROM amazon_ads.placement_daily
+    WHERE report_date BETWEEN %(start)s AND %(end)s
+    GROUP BY owner, store_name, sid, placement_type;
+    """
+    with conn() as c:
+        with c.cursor() as cur:
+            cur.execute(sql, {"start": start_date, "end": end_date})
             return cur.fetchall()
 
 

@@ -144,6 +144,15 @@ async def query_neg_words(sid: int) -> list:
     )
 
 
+async def campaign_placement_reports(sid: int, report_date: str) -> list:
+    """4-placement-type breakdown for ads: TOP OF SEARCH, DETAIL PAGE, OTHER, OFF AMAZON."""
+    return await call_all(
+        "/pb/openapi/newad/campaignPlacementReports",
+        {"sid": sid, "report_date": report_date},
+        page_size=100, is_newad=True,
+    )
+
+
 async def sp_campaigns(sid: int) -> list:
     """SP campaign list — yields {campaign_id, name, campaign_type, state, ...}.
     Source of campaign_id → human-readable name mapping (spProductAds doesn't expose name)."""
