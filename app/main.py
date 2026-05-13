@@ -191,24 +191,33 @@ async def query_windows(req: QueryRequest, authorization: Optional[str] = Header
 
 
 class WeeklyDataRequest(BaseModel):
-    end_date: Optional[str] = None    # default = T-8
+    end_date: Optional[str] = None    # YYYY-MM-DD override; otherwise computed as T - offset_days
     t14: int = 14
     t30: int = 30
     t60: int = 60
-    offset_days: int = 8
+    offset_days: Optional[int] = None  # for manual testing; production = always 8 (v2 sub-task ②)
+
+
+PRODUCTION_OFFSET_DAYS = 8  # T-8 = avoid 7-day attribution window (Q2 decision, locked)
 
 
 @app.post("/weekly-data")
-async def weekly_data(req: WeeklyDataRequest, authorization: Optional[str] = Header(None)):
+async def weekly_data(req: WeeklyDataRequest = None, authorization: Optional[str] = Header(None)):
     """Aggregated payload for v2 weekly report (n8n N2 hits this).
+
+    Production rule: end_date = T-8 (avoid attribution window). Body is optional;
+    n8n production call can be parameterless. Manual override via end_date or offset_days for testing.
 
     Returns: report_date, windows{}, owner_results{owner:{store:{boost/scale/negate/warn/...}}}, stats{}.
     Side effect: persists this week's recs into search_term_recommendation for next-week diff.
     """
     _auth(authorization)
+    if req is None:
+        req = WeeklyDataRequest()
     end = date.fromisoformat(req.end_date) if req.end_date else None
+    offset = req.offset_days if req.offset_days is not None else PRODUCTION_OFFSET_DAYS
     return weekly.build_weekly_data(end_date=end, t14=req.t14, t30=req.t30, t60=req.t60,
-                                    offset_days=req.offset_days)
+                                    offset_days=offset)
 
 
 @app.get("/coverage")
