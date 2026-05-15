@@ -107,6 +107,59 @@ async def fetch_day_rows(sid: int, store_name: str, report_date: str):
     return out
 
 
+async def fetch_targeting_day(sid: int, store_name: str, report_date: str):
+    """Pull spKeywordReports + spTargetReports for one day. Returns (kw_rows, tgt_rows)."""
+    kw_raw, tgt_raw = await asyncio.gather(
+        lingxing.sp_keyword_reports(sid, report_date),
+        lingxing.sp_target_reports(sid, report_date),
+    )
+    c_to_asin, _c_to_name, asin_to_owner = await fetch_seller_meta(sid)
+
+    def _owner_for(cid):
+        asin = c_to_asin.get(cid, "")
+        return asin_to_owner.get(asin, "未分配")
+
+    kw_rows = []
+    for r in kw_raw:
+        cid = r.get("campaign_id") or 0
+        kw_rows.append({
+            "sid": sid, "store_name": store_name, "report_date": report_date,
+            "keyword_id": r.get("keyword_id") or 0,
+            "keyword_text": r.get("keyword_text") or "",
+            "match_type": r.get("match_type") or "",
+            "ad_group_id": r.get("ad_group_id") or 0,
+            "campaign_id": cid or 0,
+            "owner": _owner_for(cid),
+            "impressions": _i(r.get("impressions")),
+            "clicks": _i(r.get("clicks")),
+            "cost": _f(r.get("cost")),
+            "orders": _i(r.get("orders")),
+            "sales": _f(r.get("sales")),
+            "units": _i(r.get("units")),
+        })
+
+    tgt_rows = []
+    for r in tgt_raw:
+        cid = r.get("campaign_id") or 0
+        tgt_rows.append({
+            "sid": sid, "store_name": store_name, "report_date": report_date,
+            "target_id": r.get("target_id") or 0,
+            "targeting_expression": r.get("targeting_expression") or "",
+            "targeting_type": r.get("targeting_type") or "",
+            "ad_group_id": r.get("ad_group_id") or 0,
+            "campaign_id": cid or 0,
+            "owner": _owner_for(cid),
+            "impressions": _i(r.get("impressions")),
+            "clicks": _i(r.get("clicks")),
+            "cost": _f(r.get("cost")),
+            "orders": _i(r.get("orders")),
+            "sales": _f(r.get("sales")),
+            "units": _i(r.get("units")),
+        })
+
+    return kw_rows, tgt_rows
+
+
 async def fetch_placement_day(sid: int, store_name: str, report_date: str):
     """Pull campaignPlacementReports for one day, map campaign→ASIN→owner."""
     rows = await lingxing.campaign_placement_reports(sid, report_date)

@@ -127,6 +127,15 @@ async def sp_keyword_reports(sid: int, report_date: str) -> list:
     )
 
 
+async def sp_target_reports(sid: int, report_date: str) -> list:
+    """ASIN / category targeting reports (商品定位)."""
+    return await call_all(
+        "/pb/openapi/newad/spTargetReports",
+        {"sid": sid, "report_date": report_date, "show_detail": 0},
+        page_size=100, is_newad=True,
+    )
+
+
 async def listings(sid: int) -> list:
     return await call_all(
         "/erp/sc/data/mws/listing",

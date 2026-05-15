@@ -96,6 +96,58 @@ DDL_INDEX_PLACEMENT = [
     "CREATE INDEX IF NOT EXISTS idx_plc_owner  ON amazon_ads.placement_daily (owner, report_date DESC);",
 ]
 
+# B-Full M2: keyword-level + target-level targeting reports
+DDL_TARGETING_KW = """
+CREATE TABLE IF NOT EXISTS amazon_ads.targeting_keyword_daily (
+  sid           INT          NOT NULL,
+  store_name    TEXT,
+  report_date   DATE         NOT NULL,
+  keyword_id    BIGINT       NOT NULL,
+  keyword_text  TEXT,
+  match_type    TEXT,
+  ad_group_id   BIGINT,
+  campaign_id   BIGINT,
+  owner         TEXT,
+  impressions   INT          DEFAULT 0,
+  clicks        INT          DEFAULT 0,
+  cost          NUMERIC(12,4) DEFAULT 0,
+  orders        INT          DEFAULT 0,
+  sales         NUMERIC(12,4) DEFAULT 0,
+  units         INT          DEFAULT 0,
+  ingested_at   TIMESTAMP    DEFAULT NOW(),
+  PRIMARY KEY (sid, report_date, keyword_id)
+);
+"""
+
+DDL_TARGETING_TGT = """
+CREATE TABLE IF NOT EXISTS amazon_ads.targeting_target_daily (
+  sid                   INT          NOT NULL,
+  store_name            TEXT,
+  report_date           DATE         NOT NULL,
+  target_id             BIGINT       NOT NULL,
+  targeting_expression  TEXT,
+  targeting_type        TEXT,
+  ad_group_id           BIGINT,
+  campaign_id           BIGINT,
+  owner                 TEXT,
+  impressions           INT          DEFAULT 0,
+  clicks                INT          DEFAULT 0,
+  cost                  NUMERIC(12,4) DEFAULT 0,
+  orders                INT          DEFAULT 0,
+  sales                 NUMERIC(12,4) DEFAULT 0,
+  units                 INT          DEFAULT 0,
+  ingested_at           TIMESTAMP    DEFAULT NOW(),
+  PRIMARY KEY (sid, report_date, target_id)
+);
+"""
+
+DDL_INDEX_TARGETING = [
+    "CREATE INDEX IF NOT EXISTS idx_tkw_lookup ON amazon_ads.targeting_keyword_daily (sid, report_date DESC);",
+    "CREATE INDEX IF NOT EXISTS idx_tkw_owner  ON amazon_ads.targeting_keyword_daily (owner, report_date DESC);",
+    "CREATE INDEX IF NOT EXISTS idx_ttgt_lookup ON amazon_ads.targeting_target_daily (sid, report_date DESC);",
+    "CREATE INDEX IF NOT EXISTS idx_ttgt_owner  ON amazon_ads.targeting_target_daily (owner, report_date DESC);",
+]
+
 
 @contextmanager
 def conn():
@@ -124,8 +176,13 @@ def init_schema():
             cur.execute(DDL_PLACEMENT)
             for sql in DDL_INDEX_PLACEMENT:
                 cur.execute(sql)
+            cur.execute(DDL_TARGETING_KW)
+            cur.execute(DDL_TARGETING_TGT)
+            for sql in DDL_INDEX_TARGETING:
+                cur.execute(sql)
     return {"ok": True, "tables": ["search_term_daily", "search_term_recommendation",
-                                    "neg_keyword_snapshot", "placement_daily"]}
+                                    "neg_keyword_snapshot", "placement_daily",
+                                    "targeting_keyword_daily", "targeting_target_daily"]}
 
 
 UPSERT_DAILY = """
@@ -217,6 +274,86 @@ def upsert_placement_rows(rows):
         with c.cursor() as cur:
             cur.executemany(UPSERT_PLACEMENT, rows)
             return cur.rowcount
+
+
+UPSERT_TARGETING_KW = """
+INSERT INTO amazon_ads.targeting_keyword_daily
+(sid, store_name, report_date, keyword_id, keyword_text, match_type, ad_group_id, campaign_id, owner,
+ impressions, clicks, cost, orders, sales, units)
+VALUES (%(sid)s,%(store_name)s,%(report_date)s,%(keyword_id)s,%(keyword_text)s,%(match_type)s,
+        %(ad_group_id)s,%(campaign_id)s,%(owner)s,
+        %(impressions)s,%(clicks)s,%(cost)s,%(orders)s,%(sales)s,%(units)s)
+ON CONFLICT (sid, report_date, keyword_id) DO UPDATE SET
+  store_name=EXCLUDED.store_name, keyword_text=EXCLUDED.keyword_text,
+  match_type=EXCLUDED.match_type, ad_group_id=EXCLUDED.ad_group_id,
+  campaign_id=EXCLUDED.campaign_id, owner=EXCLUDED.owner,
+  impressions=EXCLUDED.impressions, clicks=EXCLUDED.clicks, cost=EXCLUDED.cost,
+  orders=EXCLUDED.orders, sales=EXCLUDED.sales, units=EXCLUDED.units, ingested_at=NOW();
+"""
+
+UPSERT_TARGETING_TGT = """
+INSERT INTO amazon_ads.targeting_target_daily
+(sid, store_name, report_date, target_id, targeting_expression, targeting_type,
+ ad_group_id, campaign_id, owner,
+ impressions, clicks, cost, orders, sales, units)
+VALUES (%(sid)s,%(store_name)s,%(report_date)s,%(target_id)s,%(targeting_expression)s,
+        %(targeting_type)s,%(ad_group_id)s,%(campaign_id)s,%(owner)s,
+        %(impressions)s,%(clicks)s,%(cost)s,%(orders)s,%(sales)s,%(units)s)
+ON CONFLICT (sid, report_date, target_id) DO UPDATE SET
+  store_name=EXCLUDED.store_name, targeting_expression=EXCLUDED.targeting_expression,
+  targeting_type=EXCLUDED.targeting_type, ad_group_id=EXCLUDED.ad_group_id,
+  campaign_id=EXCLUDED.campaign_id, owner=EXCLUDED.owner,
+  impressions=EXCLUDED.impressions, clicks=EXCLUDED.clicks, cost=EXCLUDED.cost,
+  orders=EXCLUDED.orders, sales=EXCLUDED.sales, units=EXCLUDED.units, ingested_at=NOW();
+"""
+
+
+def upsert_targeting_kw_rows(rows):
+    if not rows: return 0
+    with conn() as c:
+        with c.cursor() as cur:
+            cur.executemany(UPSERT_TARGETING_KW, rows)
+            return cur.rowcount
+
+
+def upsert_targeting_tgt_rows(rows):
+    if not rows: return 0
+    with conn() as c:
+        with c.cursor() as cur:
+            cur.executemany(UPSERT_TARGETING_TGT, rows)
+            return cur.rowcount
+
+
+def aggregate_targeting_kw_14d(start_date, end_date):
+    """Aggregate keyword-level targeting metrics across 14d window grouped by (owner, store, keyword)."""
+    sql = """
+    SELECT owner, store_name, sid, keyword_id, keyword_text, match_type, campaign_id,
+      SUM(impressions) AS impressions, SUM(clicks) AS clicks,
+      SUM(cost) AS cost, SUM(orders) AS orders, SUM(sales) AS sales
+    FROM amazon_ads.targeting_keyword_daily
+    WHERE report_date BETWEEN %(start)s AND %(end)s
+    GROUP BY owner, store_name, sid, keyword_id, keyword_text, match_type, campaign_id;
+    """
+    with conn() as c:
+        with c.cursor() as cur:
+            cur.execute(sql, {"start": start_date, "end": end_date})
+            return cur.fetchall()
+
+
+def aggregate_targeting_tgt_14d(start_date, end_date):
+    """Aggregate target-level (ASIN/category) metrics across 14d window."""
+    sql = """
+    SELECT owner, store_name, sid, target_id, targeting_expression, targeting_type, campaign_id,
+      SUM(impressions) AS impressions, SUM(clicks) AS clicks,
+      SUM(cost) AS cost, SUM(orders) AS orders, SUM(sales) AS sales
+    FROM amazon_ads.targeting_target_daily
+    WHERE report_date BETWEEN %(start)s AND %(end)s
+    GROUP BY owner, store_name, sid, target_id, targeting_expression, targeting_type, campaign_id;
+    """
+    with conn() as c:
+        with c.cursor() as cur:
+            cur.execute(sql, {"start": start_date, "end": end_date})
+            return cur.fetchall()
 
 
 def aggregate_placement_14d(start_date, end_date):
